@@ -1,0 +1,131 @@
+.message-item {
+  display: flex;
+  gap: 12px;
+  max-width: 800px;
+}
+
+.message-item.user {
+  margin-left: auto;
+  flex-direction: row-reverse;
+}
+
+.message-item.assistant {
+  margin-right: auto;
+}
+
+.message-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  flex-shrink: 0;
+  background-color: #f0f0f0;
+}
+
+.message-item.user .message-avatar {
+  background-color: #007aff;
+}
+
+.message-item.assistant .message-avatar {
+  background-color: #f0f0f0;
+}
+
+.message-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.message-text {
+  padding: 12px 16px;
+  border-radius: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: 15px;
+}
+
+.message-item.user .message-text {
+  background-color: #007aff;
+  color: white;
+  border-bottom-right-radius: 4px;
+}
+
+.message-item.assistant .message-text {
+  background-color: #f0f0f0;
+  color: #000;
+  border-bottom-left-radius: 4px;
+}
+
+.message-metadata {
+  padding: 4px 16px 0;
+  font-size: 12px;
+  color: #888;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.message-item.user .message-metadata {
+  justify-content: flex-end;
+}
+
+.message-item.assistant .message-metadata {
+  justify-content: flex-start;
+}
+
+.message-time {
+  color: #999;
+}
+
+.message-model,
+.message-tokens {
+  padding: 2px 8px;
+  background-color: #f5f5f5;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #666;
+}
+
+/* 流式响应动画 */
+.message-item.streaming {
+  opacity: 0.9;
+}
+
+.streaming-indicator {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  margin-left: 8px;
+}
+
+.streaming-indicator .dot {
+  width: 6px;
+  height: 6px;
+  background-color: #007aff;
+  border-radius: 50%;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.streaming-indicator .dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.streaming-indicator .dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes pulse {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: scale(0.8);
+  }
+  30% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}

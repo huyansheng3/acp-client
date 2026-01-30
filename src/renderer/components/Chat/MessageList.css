@@ -1,0 +1,57 @@
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.empty-messages {
+  padding: 60px 20px;
+  text-align: center;
+  color: #888;
+}
+
+.empty-messages p {
+  margin: 8px 0;
+}
+
+.empty-messages .hint {
+  font-size: 14px;
+  color: #aaa;
+}
+
+/* 流式消息样式 */
+.message-item.streaming .streaming-indicator {
+  display: flex;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.message-item.streaming .streaming-indicator .dot {
+  width: 6px;
+  height: 6px;
+  background-color: #007aff;
+  border-radius: 50%;
+  animation: bounce 1.4s infinite ease-in-out both;
+}
+
+.message-item.streaming .streaming-indicator .dot:nth-child(1) {
+  animation-delay: -0.32s;
+}
+
+.message-item.streaming .streaming-indicator .dot:nth-child(2) {
+  animation-delay: -0.16s;
+}
+
+@keyframes bounce {
+  0%, 80%, 100% {
+    transform: scale(0);
+  }
+  40% {
+    transform: scale(1);
+  }
+}
+
+.message-text.thinking {
+  color: #888;
+  font-style: italic;
+}
