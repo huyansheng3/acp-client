@@ -5,6 +5,7 @@ import { SessionManager } from '../managers/SessionManager';
 import { DatabaseManager } from '../managers/DatabaseManager';
 import { ConfigManager } from '../managers/ConfigManager';
 import { Conversation, Message } from '../../types/conversation';
+import { ACPPermissionResponse } from '../acp';
 import {
   writeRendererLog,
   listLogFiles,
@@ -156,9 +157,9 @@ export function setupIPCHandlers(
         updatedAt: Date.now(),
       });
 
-      // 获取或创建 Claude 会话
-      logger.debug('Getting or creating session', { conversationId });
-      const session = sessionManager.getOrCreateSession(conversationId);
+      // 获取或创建 ACP 会话
+      logger.debug('Getting or creating ACP session', { conversationId });
+      const session = await sessionManager.getOrCreateSession(conversationId);
 
       // 创建 assistant 消息
       const assistantMessageId = uuidv4();
@@ -173,27 +174,42 @@ export function setupIPCHandlers(
           throw new Error('Session not found or invalid');
         }
 
-        logger.info('Calling session.sendMessage');
-        // 流式发送消息
-        await session.sendMessage(content, (chunk) => {
-          if (typeof chunk === 'string' && chunk.length > 0) {
-            fullResponse += chunk;
+        logger.info('Calling session.prompt (ACP)');
+        // 使用 ACP session 的 prompt 方法
+        const result = await session.prompt(content, (update) => {
+          // 实际数据结构: { sessionId, update: { sessionUpdate, content, ... } }
+          // 需要解包 update 字段
+          const innerUpdate = (update as any).update || update;
+          const sessionUpdate = innerUpdate.sessionUpdate;
+          const contentData = innerUpdate.content;
 
-            // 每个 chunk 都发送，让前端实时显示
-            logger.debug('Sending MESSAGE_STREAM chunk', { 
-              chunkLength: chunk.length,
-              totalLength: fullResponse.length 
-            });
-            mainWindow.webContents.send(IPCChannel.MESSAGE_STREAM, {
-              conversationId,
-              messageId: assistantMessageId,
-              chunk,
-              done: false,
-            });
+          // 处理 agent_message_chunk 类型的更新
+          if (sessionUpdate === 'agent_message_chunk') {
+            const chunk = contentData?.text || '';
+            if (chunk.length > 0) {
+              fullResponse += chunk;
+              
+              logger.debug('Sending MESSAGE_STREAM chunk', { 
+                chunkLength: chunk.length,
+                totalLength: fullResponse.length 
+              });
+              mainWindow.webContents.send(IPCChannel.MESSAGE_STREAM, {
+                conversationId,
+                messageId: assistantMessageId,
+                chunk,
+                done: false,
+              });
+            }
+          } else if (sessionUpdate === 'tool_call') {
+            // 转发工具调用事件
+            mainWindow.webContents.send(IPCChannel.ACP_TOOL_CALL, innerUpdate);
+          } else if (sessionUpdate === 'tool_call_update') {
+            // 转发工具调用更新事件
+            mainWindow.webContents.send(IPCChannel.ACP_TOOL_CALL_UPDATE, innerUpdate);
           }
         });
 
-        logger.info('session.sendMessage completed', { responseLength: fullResponse.length });
+        logger.info('session.prompt completed', { responseLength: fullResponse.length, stopReason: result?.stopReason });
 
         // 保存完整响应
         const assistantMessage: Message = {
@@ -266,46 +282,45 @@ export function setupIPCHandlers(
     }
   );
 
-  // ==================== Claude 进程管理 ====================
+  // ==================== ACP 进程管理 ====================
 
   /**
-   * 注入消息（人工干预）
+   * 取消当前请求 (ACP)
    */
   ipcMain.handle(
-    IPCChannel.CLAUDE_INJECT,
-    async (_event, conversationId: string, message: string): Promise<void> => {
-      if (!conversationId || !message) {
-        throw new Error('Invalid conversationId or message');
-      }
-
-      const session = sessionManager.getSession(conversationId);
-      if (!session) {
-        throw new Error('Session not found');
-      }
-
-      try {
-        await session.injectMessage(message);
-      } catch (error) {
-        console.error('Error in CLAUDE_INJECT:', error);
-        throw error;
-      }
-    }
-  );
-
-  /**
-   * 停止 Claude 会话
-   */
-  ipcMain.handle(
-    IPCChannel.CLAUDE_STOP,
+    IPCChannel.ACP_CANCEL,
     async (_event, conversationId: string): Promise<void> => {
       if (!conversationId) {
         throw new Error('Invalid conversationId');
       }
 
+      const session = sessionManager.getSession(conversationId);
+      if (session) {
+        try {
+          await session.cancel();
+          logger.info('Cancelled session', { conversationId });
+        } catch (error) {
+          logger.error('Error cancelling session', error);
+          throw error;
+        }
+      }
+    }
+  );
+
+  /**
+   * 权限响应 (ACP)
+   */
+  ipcMain.handle(
+    IPCChannel.ACP_PERMISSION_RESPONSE,
+    async (_event, response: ACPPermissionResponse): Promise<void> => {
       try {
-        sessionManager.destroySession(conversationId);
+        sessionManager.respondToPermission(response);
+        logger.info('Permission response sent', { 
+          toolCallId: response.toolCallId, 
+          granted: response.granted 
+        });
       } catch (error) {
-        console.error('Error in CLAUDE_STOP:', error);
+        logger.error('Error responding to permission', error);
         throw error;
       }
     }

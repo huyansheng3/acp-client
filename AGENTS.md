@@ -221,147 +221,167 @@ export interface ToolCall {
 
 ## Claude Code 集成
 
-### 集成方案：使用 @anthropic-ai/claude-agent-sdk
+### 集成方案：使用 @agentclientprotocol/sdk 实现 ACP 通信
 
-本项目使用 **@anthropic-ai/claude-agent-sdk** 和 **Vercel AI SDK** 集成 Claude Code Agent，通过 ACP（Agent Client Protocol）进行通信。
+本项目使用 **@agentclientprotocol/sdk** 作为 ACP Client，通过 **stdio** 与 **Claude Code Agent** 子进程进行通信。这是真正的 ACP（Agent Client Protocol）实现。
 
 #### 架构说明
 
 ```
-ACP Client (本应用)
-    ↓
-claudeCode() from @anthropic-ai/claude-agent-sdk
-    ↓ ACP 协议通信
-Claude Code Agent (本地/远程进程)
-    ↓
-Anthropic API / 其他 Provider
+┌─────────────────────────────────────────────────────────────┐
+│                    Electron 主进程                           │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │ ACPClient (使用 @agentclientprotocol/sdk)             │  │
+│  │   - ClientSideConnection                              │  │
+│  │   - JSON-RPC 2.0 over stdio                           │  │
+│  └─────────────────────────┬─────────────────────────────┘  │
+└────────────────────────────┼────────────────────────────────┘
+                             │ stdin/stdout (JSON-RPC)
+┌────────────────────────────▼────────────────────────────────┐
+│              Claude Code Agent 子进程                        │
+│    (通过 `claude --acp` 启动)                                │
+│                             │                                │
+│                             ▼                                │
+│                    Anthropic API                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 **关键点**：
-- **不是直接调用 Anthropic API**，而是通过 Claude Code SDK 与 Agent 通信
-- **Claude Code SDK 自动处理**：配置读取、权限管理、工具调用等
-- **settingSources: ['user']** 会自动读取 `~/.claude/settings.json`
-- 支持多种 **Provider**：Anthropic、Amazon Bedrock、Google Vertex AI 等
+- **真正的 ACP 协议通信**：使用 `@agentclientprotocol/sdk` 建立与 Agent 的连接
+- **stdio 传输层**：Client 启动 Agent 子进程，通过 stdin/stdout 交换 JSON-RPC 消息
+- **Agent 能力**：Claude Code Agent 具备文件读写、终端执行、工具调用等能力
+- **双向通信**：Client 发送 prompt，Agent 通过 notifications 实时更新状态
+- **权限控制**：Agent 可以请求 Client 授权工具调用
 
-#### ClaudeCodeProcess 类
+#### ACPClient 类
 
 ```typescript
-// src/main/claude/ClaudeCodeProcess.ts
-import { streamText } from 'ai';
-import { claudeCode, type MessageInjector } from '@anthropic-ai/claude-agent-sdk';
+// src/main/acp/ACPClient.ts
+import { spawn, ChildProcess } from 'child_process';
 
-export interface ClaudeConfig {
-  model?: string;
-  systemPrompt?: string;
-  apiKey?: string;
-  provider?: string; // 支持配置 provider
+export interface ACPClientConfig {
+  agentCommand?: string[];  // 默认: ['claude-code-acp']
+  workingDir?: string;
 }
 
-export class ClaudeCodeProcess {
-  private sessionId: string;
-  private config: ClaudeConfig;
-  private model: any = null;
-  private injector: MessageInjector | null = null;
+export class ACPClient {
+  private agentProcess: ChildProcess | null = null;
+  private connection: ClientSideConnection | null = null;
+  private config: ACPClientConfig;
 
-  constructor(sessionId: string, config: ClaudeConfig) {
-    this.sessionId = sessionId;
-    this.config = config;
+  constructor(config: ACPClientConfig = {}) {
+    this.config = {
+      // 使用 @zed-industries/claude-code-acp 适配器
+      // 需要先安装: npm install -g @zed-industries/claude-code-acp
+      agentCommand: config.agentCommand || ['claude-code-acp'],
+      workingDir: config.workingDir || process.cwd(),
+    };
   }
 
   /**
-   * 延迟初始化：只在第一次发送消息时创建 Claude Code Agent
+   * 启动 Agent 子进程并建立 ACP 连接
    */
-  private async getModel() {
-    if (this.model) return this.model;
-
-    // 创建 claudeCode agent
-    // settingSources: ['user'] 会自动读取 ~/.claude/settings.json
-    this.model = claudeCode(this.config.model || 'sonnet', {
-      systemPrompt: this.config.systemPrompt,
-      persistSession: false, // 我们自己管理会话持久化
-      settingSources: ['user'], // 读取 ~/.claude/settings.json 配置
-      streamingInput: 'always', // 总是启用流式输入
-      onStreamStart: (injector) => {
-        // 保存 injector 用于消息注入
-        this.injector = injector;
+  async connect(): Promise<void> {
+    const [cmd, ...args] = this.config.agentCommand!;
+    
+    // 1. 启动 Agent 子进程
+    this.agentProcess = spawn(cmd, args, {
+      cwd: this.config.workingDir,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env },  // 传递环境变量（包括 ANTHROPIC_API_KEY）
+    });
+    
+    // 2. 初始化握手
+    await this.connection.initialize({
+      clientInfo: { name: 'acp-client', version: '1.0.0' },
+      capabilities: {
+        'fs.readTextFile': true,
+        'fs.writeTextFile': true,
+        terminal: true,
       },
     });
-
-    return this.model;
   }
 
   /**
-   * 发送消息并获取流式响应
+   * 创建新会话
    */
-  async sendMessage(
-    prompt: string,
-    onChunk: (chunk: string) => void
-  ): Promise<string> {
-    const model = await this.getModel();
-    
-    // 使用 Vercel AI SDK 的 streamText
-    const result = streamText({ model, prompt });
-
-    let fullText = '';
-    for await (const chunk of result.textStream) {
-      fullText += chunk;
-      onChunk(chunk);
+  async newSession(sessionId?: string): Promise<ACPSession> {
+    if (!this.connection) {
+      throw new Error('Not connected');
     }
-
-    return fullText;
+    const result = await this.connection.newSession({ sessionId });
+    return new ACPSession(this.connection, result.sessionId);
   }
 
   /**
-   * 中途注入消息（Claude Code SDK 核心特性）
+   * 关闭连接
    */
-  async injectMessage(message: string): Promise<void> {
-    if (!this.injector) {
-      throw new Error('Message injector not available');
+  async disconnect(): Promise<void> {
+    if (this.agentProcess) {
+      this.agentProcess.kill();
+      this.agentProcess = null;
     }
-    this.injector.inject(message);
-  }
-
-  destroy(): void {
-    this.model = null;
-    this.injector = null;
+    this.connection = null;
   }
 }
 ```
 
-#### SessionManager 类
+#### ACPSession 类
 
 ```typescript
-// src/main/managers/SessionManager.ts
-export class SessionManager {
-  private sessions: Map<string, ClaudeCodeProcess> = new Map();
-  private defaultConfig: ClaudeConfig;
+// src/main/acp/ACPSession.ts
+import { ClientSideConnection } from '@agentclientprotocol/sdk';
+import type { SessionUpdate, PromptResult } from '@agentclientprotocol/sdk';
 
-  createSession(conversationId: string, config?: Partial<ClaudeConfig>): ClaudeCodeProcess {
-    const mergedConfig = { ...this.defaultConfig, ...config };
-    const session = new ClaudeCodeProcess(conversationId, mergedConfig);
-    this.sessions.set(conversationId, session);
-    return session;
+export class ACPSession {
+  private connection: ClientSideConnection;
+  private sessionId: string;
+  private updateListeners: ((update: SessionUpdate) => void)[] = [];
+
+  constructor(connection: ClientSideConnection, sessionId: string) {
+    this.connection = connection;
+    this.sessionId = sessionId;
   }
 
-  getOrCreateSession(conversationId: string): ClaudeCodeProcess {
-    let session = this.sessions.get(conversationId);
-    if (!session) {
-      session = this.createSession(conversationId);
+  /**
+   * 发送 prompt 并等待完成
+   */
+  async prompt(
+    content: string,
+    onUpdate?: (update: SessionUpdate) => void
+  ): Promise<PromptResult> {
+    // 注册更新回调
+    const listener = (update: SessionUpdate) => {
+      if (update.sessionId === this.sessionId && onUpdate) {
+        onUpdate(update);
+      }
+    };
+    this.updateListeners.push(listener);
+    
+    try {
+      // 发送 session/prompt
+      const result = await this.connection.prompt({
+        sessionId: this.sessionId,
+        prompt: [{ type: 'text', text: content }],
+      });
+      
+      return result;
+    } finally {
+      // 移除监听器
+      const index = this.updateListeners.indexOf(listener);
+      if (index > -1) this.updateListeners.splice(index, 1);
     }
-    return session;
   }
 
-  destroySession(conversationId: string): void {
-    const session = this.sessions.get(conversationId);
-    if (session) {
-      session.destroy();
-      this.sessions.delete(conversationId);
-    }
+  /**
+   * 取消当前请求
+   */
+  async cancel(): Promise<void> {
+    await this.connection.cancel();
   }
 
-  destroyAll(): void {
-    this.sessions.forEach((session) => session.destroy());
-    this.sessions.clear();
+  getSessionId(): string {
+    return this.sessionId;
   }
 }
 ```
@@ -532,7 +552,7 @@ export class ConfigManager {
 
 #### Provider 配置
 
-Claude Code SDK 支持多种 Provider，可以通过环境变量配置：
+Claude Code Agent 支持多种 Provider，可以通过环境变量配置：
 
 ```bash
 # 默认使用 Anthropic API
@@ -550,9 +570,70 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/credentials.json"
 ```
 
 **注意**：
-- `settingSources: ['user']` 会自动读取 `~/.claude/settings.json`
-- Claude Code SDK 会根据环境变量自动选择合适的 Provider
+- Claude Code Agent 会自动读取 `~/.claude/settings.json`
+- Agent 会根据环境变量自动选择合适的 Provider
 - 我们的 ConfigManager 主要用于应用层的配置管理
+
+---
+
+## ACP 通信流程
+
+### ACP 协议核心概念
+
+ACP (Agent Client Protocol) 基于 **JSON-RPC 2.0** 规范，通过 **stdio** 传输层进行通信。
+
+### 消息类型
+
+- **Methods**: 请求-响应对，期望收到结果或错误
+- **Notifications**: 单向消息，不期望响应
+
+### 消息流程图
+
+```mermaid
+sequenceDiagram
+    participant Client as ACP Client
+    participant Agent as Claude Code Agent
+    participant LLM as Anthropic API
+    
+    Note over Client,Agent: 连接初始化
+    Client->>Agent: initialize (协商版本和能力)
+    Agent-->>Client: initialize 响应
+    
+    Note over Client,Agent: 会话设置
+    Client->>Agent: session/new (创建新会话)
+    Agent-->>Client: session/new 响应 (sessionId)
+    
+    Note over Client,Agent: Prompt Turn
+    Client->>Agent: session/prompt (用户消息)
+    
+    loop 直到完成
+        Agent->>LLM: 调用模型
+        LLM-->>Agent: 模型响应
+        Agent-->>Client: session/update (agent_message_chunk)
+        
+        opt 工具调用
+            Agent-->>Client: session/update (tool_call)
+            opt 需要权限
+                Agent->>Client: session/request_permission
+                Client-->>Agent: 权限响应
+            end
+            Agent-->>Client: session/update (tool_call_update)
+        end
+    end
+    
+    Agent-->>Client: session/prompt 响应 (stopReason)
+```
+
+### 核心 ACP 方法
+
+| 方法 | 方向 | 说明 |
+|------|------|------|
+| `initialize` | Client → Agent | 建立连接，协商版本和能力 |
+| `session/new` | Client → Agent | 创建新会话 |
+| `session/prompt` | Client → Agent | 发送用户消息 |
+| `session/cancel` | Client → Agent | 取消当前操作 |
+| `session/update` | Agent → Client | 流式更新通知 |
+| `session/request_permission` | Agent → Client | 请求工具授权 |
 
 
 ---
@@ -575,9 +656,15 @@ export enum IPCChannel {
   MESSAGE_LIST = 'message:list',
   MESSAGE_STREAM = 'message:stream', // 流式响应
 
-  // Claude 进程
-  CLAUDE_INJECT = 'claude:inject',
-  CLAUDE_STOP = 'claude:stop',
+  // ACP 进程管理
+  ACP_CANCEL = 'acp:cancel',
+  
+  // ACP 事件
+  ACP_SESSION_UPDATE = 'acp:session:update',
+  ACP_TOOL_CALL = 'acp:tool:call',
+  ACP_TOOL_CALL_UPDATE = 'acp:tool:call:update',
+  ACP_PERMISSION_REQUEST = 'acp:permission:request',
+  ACP_PERMISSION_RESPONSE = 'acp:permission:response',
 
   // 配置
   CONFIG_GET = 'config:get',
@@ -609,6 +696,10 @@ const electronAPI = {
   listMessages: (conversationId: string): Promise<Message[]> =>
     ipcRenderer.invoke(IPCChannel.MESSAGE_LIST, conversationId),
 
+  // 取消当前请求
+  cancelMessage: (conversationId: string): Promise<void> =>
+    ipcRenderer.invoke(IPCChannel.ACP_CANCEL, conversationId),
+
   // 监听流式消息
   onMessageStream: (callback: (data: any) => void) => {
     ipcRenderer.on(IPCChannel.MESSAGE_STREAM, (_event, data) => callback(data));
@@ -618,6 +709,22 @@ const electronAPI = {
     ipcRenderer.removeAllListeners(IPCChannel.MESSAGE_STREAM);
   },
 
+  // ACP 事件监听
+  onToolCall: (callback: (data: any) => void) => {
+    ipcRenderer.on(IPCChannel.ACP_TOOL_CALL, (_event, data) => callback(data));
+  },
+
+  onToolCallUpdate: (callback: (data: any) => void) => {
+    ipcRenderer.on(IPCChannel.ACP_TOOL_CALL_UPDATE, (_event, data) => callback(data));
+  },
+
+  onPermissionRequest: (callback: (data: any) => void) => {
+    ipcRenderer.on(IPCChannel.ACP_PERMISSION_REQUEST, (_event, data) => callback(data));
+  },
+
+  respondToPermission: (response: PermissionResponse): Promise<void> =>
+    ipcRenderer.invoke(IPCChannel.ACP_PERMISSION_RESPONSE, response),
+
   // 配置
   getConfig: () => ipcRenderer.invoke(IPCChannel.CONFIG_GET),
 };
@@ -625,7 +732,7 @@ const electronAPI = {
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);
 ```
 
-### 主进程 IPC 处理器
+### 主进程 IPC 处理器（适配 ACP）
 
 ```typescript
 // src/main/ipc/handlers.ts
@@ -643,23 +750,37 @@ export function setupIPCHandlers(
       const userMessage = { id: uuidv4(), conversationId, role: 'user', content, createdAt: Date.now() };
       await dbManager.createMessage(userMessage);
 
-      // 2. 获取或创建 Claude 会话
-      const session = sessionManager.getOrCreateSession(conversationId);
+      // 2. 获取或创建 ACP 会话
+      const session = await sessionManager.getOrCreateSession(conversationId);
 
       // 3. 流式发送消息
       const assistantMessageId = uuidv4();
       let fullResponse = '';
 
-      await session.sendMessage(content, (chunk) => {
-        fullResponse += chunk;
-        
-        // 发送流式更新（节流 100ms）
-        mainWindow.webContents.send(IPCChannel.MESSAGE_STREAM, {
-          conversationId,
-          messageId: assistantMessageId,
-          chunk,
-          done: false,
-        });
+      // 使用 ACP session 的 prompt 方法
+      const result = await session.prompt(content, (update) => {
+        // 处理不同类型的更新
+        switch (update.sessionUpdate) {
+          case 'agent_message_chunk':
+            const chunk = update.content?.text || '';
+            fullResponse += chunk;
+            mainWindow.webContents.send(IPCChannel.MESSAGE_STREAM, {
+              conversationId,
+              messageId: assistantMessageId,
+              chunk,
+              done: false,
+            });
+            break;
+          
+          case 'tool_call':
+            // 转发工具调用事件到渲染进程
+            mainWindow.webContents.send(IPCChannel.ACP_TOOL_CALL, update);
+            break;
+          
+          case 'tool_call_update':
+            mainWindow.webContents.send(IPCChannel.ACP_TOOL_CALL_UPDATE, update);
+            break;
+        }
       });
 
       // 4. 保存完整响应
@@ -669,6 +790,7 @@ export function setupIPCHandlers(
         role: 'assistant',
         content: fullResponse,
         createdAt: Date.now(),
+        metadata: { stopReason: result.stopReason },
       };
       await dbManager.createMessage(assistantMessage);
 
@@ -678,9 +800,29 @@ export function setupIPCHandlers(
         messageId: assistantMessageId,
         chunk: '',
         done: true,
+        stopReason: result.stopReason,
       });
 
       return { userMessage, assistantMessage };
+    }
+  );
+
+  // 取消当前请求
+  ipcMain.handle(
+    IPCChannel.ACP_CANCEL,
+    async (_event, conversationId: string) => {
+      const session = sessionManager.getSession(conversationId);
+      if (session) {
+        await session.cancel();
+      }
+    }
+  );
+
+  // 权限响应
+  ipcMain.handle(
+    IPCChannel.ACP_PERMISSION_RESPONSE,
+    async (_event, response: PermissionResponse) => {
+      await sessionManager.respondToPermission(response);
     }
   );
 }
@@ -823,9 +965,13 @@ acp-client/
 │   │   ├── managers/
 │   │   │   ├── DatabaseManager.ts # SQLite 数据库管理
 │   │   │   ├── ConfigManager.ts   # 配置读取（~/.claude/settings.json）
-│   │   │   └── SessionManager.ts  # Claude 会话管理
+│   │   │   └── SessionManager.ts  # ACP 会话管理
+│   │   ├── acp/                       # ACP 通信层
+│   │   │   ├── ACPClient.ts       # ACP 连接管理
+│   │   │   ├── ACPSession.ts      # ACP 会话封装
+│   │   │   └── types.ts           # ACP 类型定义
 │   │   ├── claude/
-│   │   │   └── ClaudeCodeProcess.ts # Claude Code 进程封装
+│   │   │   └── ClaudeCodeProcess.ts # Claude Code 进程封装（已废弃，使用 ACPSession）
 │   │   └── ipc/
 │   │       └── handlers.ts        # IPC 处理器
 │   ├── renderer/                  # 渲染进程
@@ -892,11 +1038,12 @@ cd ../..
 - ✅ 定义 SQLite schema
 - ✅ 实现 CRUD 操作
 
-### 第 4 步：实现 Claude 集成
+### 第 4 步：实现 ACP 集成
 
-- ✅ `ConfigManager.ts` 读取 `~/.claude/settings.json`
-- ✅ `ClaudeCodeProcess.ts` 封装 SDK
-- ✅ `SessionManager.ts` 管理多进程
+- ✅ 创建 `src/main/acp/ACPClient.ts`
+- ✅ 创建 `src/main/acp/ACPSession.ts`
+- ✅ 创建 `src/main/acp/types.ts`
+- ✅ `SessionManager.ts` 管理 ACP 连接
 
 ### 第 5 步：实现 IPC 通信
 
@@ -922,24 +1069,24 @@ cd ../..
 
 ## 关键技术难点
 
-### 1. 多进程管理
+### 1. ACP 连接管理
 
-**挑战**：每个会话启动独立的 Claude Code 进程
-
-**解决方案**：
-- SessionManager 维护 `Map<conversationId, ClaudeCodeProcess>`
-- 会话关闭时主动调用 `destroy()` 清理资源
-- 应用退出时 `destroyAll()` 清理所有进程
-
-### 2. 流式消息处理
-
-**挑战**：Claude 响应是流式的，需要实时更新 UI
+**挑战**：管理与 Agent 子进程的生命周期和重连
 
 **解决方案**：
-- 使用 `streamText` API 的 `textStream` 迭代器
-- 主进程通过 `webContents.send()` 发送流式更新
-- 渲染进程监听 `MESSAGE_STREAM` 事件，追加 chunk
-- **节流优化**：每 100ms 最多发送一次，避免频繁渲染
+- ACPClient 维护 `ChildProcess` 引用
+- 监听进程 `exit` 事件，自动重连
+- 应用退出时主动 kill 子进程
+- 使用 stdio 传输，避免网络问题
+
+### 2. ACP 消息处理
+
+**挑战**：Agent 通过 notifications 流式返回多种类型的更新
+
+**解决方案**：
+- `session/update` 包含 `agent_message_chunk`、`tool_call`、`plan` 等类型
+- 主进程根据 `sessionUpdate` 类型分发到不同 IPC 通道
+- 渲染进程分别处理消息内容、工具调用状态等
 
 ### 3. 数据库路径管理
 
@@ -953,14 +1100,15 @@ const dbPath = isDebug
   : path.join(app.getPath('userData'), databaseName); // 生产模式：用户数据目录
 ```
 
-### 4. 会话恢复
+### 4. 权限管理
 
-**挑战**：支持从数据库恢复历史会话
+**挑战**：Agent 需要请求用户授权工具调用
 
 **解决方案**：
-- 保存 `claudeSessionId` 到数据库
-- SessionManager 延迟创建进程（首次发送消息时）
-- 读取历史消息时不启动 Claude 进程
+- Agent 发送 `session/request_permission` 请求
+- 主进程转发到渲染进程展示确认对话框
+- 用户决定后通过 IPC 返回结果
+- 主进程响应 Agent 的权限请求
 
 ### 5. 原生模块编译
 
@@ -978,12 +1126,12 @@ const dbPath = isDebug
 ### 已实现 ✅
 
 - [x] 多会话并行
+- [x] ACP 协议通信（通过 stdio 与 Claude Code Agent 通信）
 - [x] 流式消息响应
 - [x] 完整会话记录持久化
 - [x] 简洁现代的 UI
 - [x] 快捷键支持（Cmd/Ctrl + Enter）
 - [x] 自动滚动到最新消息
-- [x] 节流优化
 
 ### 计划中 🔮
 
@@ -1034,18 +1182,20 @@ const dbPath = isDebug
 
 ### 核心亮点
 
-1. **真正的多会话并行**：每个会话独立的 Claude Code 进程，互不干扰
-2. **流式响应体验**：实时显示 Claude 的思考过程
-3. **完整数据持久化**：SQLite 保存所有会话，支持离线查看
-4. **配置灵活性**：兼容 Claude Code 官方配置文件
-5. **安全的 IPC 通信**：使用 contextBridge，遵循 Electron 最佳实践
-6. **现代化 UI**：简洁、响应式、用户友好
+1. **真正的 ACP 协议实现**：通过 `@agentclientprotocol/sdk` 与 Claude Code Agent 进行标准化通信
+2. **stdio 传输层**：使用子进程 stdin/stdout 进行 JSON-RPC 消息交换
+3. **完整的 Agent 能力**：支持文件读写、终端执行、工具调用等
+4. **流式响应体验**：实时显示 Claude 的思考过程和工具执行状态
+5. **完整数据持久化**：SQLite 保存所有会话，支持离线查看
+6. **安全的 IPC 通信**：使用 contextBridge，遵循 Electron 最佳实践
+7. **权限管理**：Agent 工具调用需要用户授权
 
 ### 技术创新
 
-- **SDK 封装**：将 Claude Agent SDK 封装为进程类，便于管理
-- **流式节流**：避免频繁更新 UI 导致性能问题
-- **延迟创建**：只在需要时创建 Claude 进程，节省资源
+- **ACP SDK 封装**：使用 `ClientSideConnection` 实现标准化通信
+- **stdio 子进程管理**：启动 `claude --acp` 作为 Agent 子进程
+- **双向 JSON-RPC**：支持 methods 和 notifications
+- **事件驱动更新**：`session/update` 实时推送状态变化
 - **两层 package.json**：优化打包体积
 
 ### 适用场景
@@ -1061,23 +1211,24 @@ const dbPath = isDebug
 
 ### 官方文档
 
-- [Anthropic Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript)
+- [ACP Protocol Documentation](https://agentclientprotocol.com)
+- [ACP TypeScript SDK](https://agentclientprotocol.github.io/typescript-sdk)
 - [Electron Documentation](https://www.electronjs.org/docs)
 - [electron-react-boilerplate](https://github.com/electron-react-boilerplate/electron-react-boilerplate)
 
 ### 技术文章
 
-- [ACP (Agent Client Protocol) 详解](https://code.claude.com/docs/en/acp)
+- [ACP Protocol Overview](https://agentclientprotocol.com/protocol/overview)
+- [ACP Transports - stdio](https://agentclientprotocol.com/protocol/transports)
 - [Electron IPC 最佳实践](https://www.electronjs.org/docs/latest/tutorial/ipc)
-- [SQLite in Electron](https://github.com/mapbox/node-sqlite3)
 
-### 相关项目
+### 参考实现
 
-- [Claude Code Official](https://code.claude.com/)
-- [Claude Agent SDK Demos](https://github.com/anthropics/claude-agent-sdk-demos)
+- [Gemini CLI ACP 实现](https://github.com/google-gemini/gemini-cli/blob/main/packages/cli/src/zed-integration/zedIntegration.ts)
+- [ACP TypeScript SDK Examples](https://github.com/agentclientprotocol/typescript-sdk/tree/main/src/examples)
 
 ---
 
-**文档版本**: v1.0  
+**文档版本**: v2.0 (ACP 协议实现)  
 **作者**: ACP Client Development Team  
 **最后更新**: 2026/01/30

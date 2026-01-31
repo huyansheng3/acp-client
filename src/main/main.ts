@@ -111,37 +111,53 @@ const createWindow = async () => {
 
   // 初始化 SessionManager 和 IPC 处理器
   const config = configManager.readSettings();
+  
+  // 从 ~/.claude/settings.json 读取 API Key 并构建环境变量
   const apiKey = configManager.getApiKey();
+  const agentEnv: Record<string, string> = {};
   
-  // 构建 Claude 配置
-  let claudeConfig: any = {
-    model: configManager.getModel(),
-  };
-  
-  // 设置 base URL（如果有）
-  if (config.env?.ANTHROPIC_BASE_URL) {
-    claudeConfig.baseUrl = config.env.ANTHROPIC_BASE_URL;
-  }
-  
-  // 设置认证信息
   if (apiKey) {
-    // 检查是认证 token 还是 API key
-    // settings.json 中使用 ANTHROPIC_AUTH_TOKEN 的情况
+    // 检查是 Auth Token 还是 API Key
     if (config.env?.ANTHROPIC_AUTH_TOKEN) {
-      claudeConfig.authToken = apiKey;
+      agentEnv.ANTHROPIC_AUTH_TOKEN = apiKey;
     } else {
-      claudeConfig.apiKey = apiKey;
+      agentEnv.ANTHROPIC_API_KEY = apiKey;
     }
   }
+  
+  // 合并 settings.json 中的其他环境变量
+  if (config.env) {
+    Object.entries(config.env).forEach(([key, value]) => {
+      if (!agentEnv[key]) {
+        agentEnv[key] = value;
+      }
+    });
+  }
+  
+  // 构建 ACP 配置
+  // 默认使用 @zed-industries/claude-code-acp 适配器
+  // 需要先安装: npm install -g @zed-industries/claude-code-acp
+  const acpConfig = {
+    // Agent 启动命令，可通过配置文件自定义
+    agentCommand: config.agentCommand || ['claude-code-acp'],
+    workingDir: process.cwd(),
+    clientInfo: {
+      name: 'acp-client',
+      version: '1.0.0',
+    },
+    // 注入环境变量到 Agent 子进程
+    env: agentEnv,
+  };
 
-  logger.info('Claude config initialized', {
-    model: claudeConfig.model,
-    hasApiKey: !!claudeConfig.apiKey,
-    hasAuthToken: !!claudeConfig.authToken,
-    baseUrl: claudeConfig.baseUrl || 'default',
+  logger.info('ACP config initialized', {
+    agentCommand: acpConfig.agentCommand,
+    workingDir: acpConfig.workingDir,
+    hasApiKey: !!agentEnv.ANTHROPIC_API_KEY,
+    hasAuthToken: !!agentEnv.ANTHROPIC_AUTH_TOKEN,
   });
   
-  sessionManager = new SessionManager(claudeConfig);
+  sessionManager = new SessionManager({ acpConfig });
+  sessionManager.setMainWindow(mainWindow);
 
   setupIPCHandlers(mainWindow, sessionManager, dbManager, configManager);
 
@@ -163,10 +179,10 @@ const createWindow = async () => {
  * Add event listeners...
  */
 
-app.on('window-all-closed', () => {
+app.on('window-all-closed', async () => {
   // 清理资源
   if (sessionManager) {
-    sessionManager.destroyAll();
+    await sessionManager.destroyAll();
   }
   dbManager.close();
 

@@ -13,10 +13,15 @@ export enum IPCChannel {
   MESSAGE_LIST = 'message:list',
   MESSAGE_STREAM = 'message:stream', // 流式响应
 
-  // Claude 进程
-  CLAUDE_START = 'claude:start',
-  CLAUDE_STOP = 'claude:stop',
-  CLAUDE_INJECT = 'claude:inject',
+  // ACP 进程管理
+  ACP_CANCEL = 'acp:cancel',
+
+  // ACP 事件
+  ACP_SESSION_UPDATE = 'acp:session:update',
+  ACP_TOOL_CALL = 'acp:tool:call',
+  ACP_TOOL_CALL_UPDATE = 'acp:tool:call:update',
+  ACP_PERMISSION_REQUEST = 'acp:permission:request',
+  ACP_PERMISSION_RESPONSE = 'acp:permission:response',
 
   // 配置
   CONFIG_GET = 'config:get',

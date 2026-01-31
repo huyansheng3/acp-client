@@ -16,6 +16,8 @@ export interface ClaudeSettings {
     additionalDirectories?: string[];
     defaultMode?: string;
   };
+  /** ACP Agent 启动命令，默认 ['claude', '--acp'] */
+  agentCommand?: string[];
 }
 
 /**
